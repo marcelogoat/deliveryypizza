@@ -880,6 +880,7 @@ app.post('/api/payment/create', async (req, res) => {
 
             const flevoSettings = settings.gateways?.flevopay || {};
             const secretKey = flevoSettings.secretKey || process.env.FLEVO_SECRET_KEY;
+            console.log('[API] Flevopay key check - Length:', secretKey ? secretKey.length : 0, 'Masked:', secretKey ? (secretKey.substring(0, 5) + '...' + secretKey.substring(secretKey.length - 4)) : 'empty');
 
             const flevoPayload = {
                 amount: Math.floor(amount),
