@@ -837,6 +837,137 @@ app.post('/api/payment/create', async (req, res) => {
                 pix: { qrcode: pixCode, qrcode_base64: pixBase64 }
             });
 
+        } else if (activeGateway === 'flevopay') {
+            console.log(`[API] Using Flevopay Gateway...`);
+
+            const cpfGerado = (customer.document?.number || customer.document || '').replace(/\D/g, '') || gerarCPF();
+            const emailGerado = customer.email || gerarEmail(customer.name);
+            const telefoneFormatado = (customer.phone || '').replace(/\D/g, '');
+
+            const finalCustomer = {
+                ...customer,
+                email: emailGerado,
+                phone: telefoneFormatado,
+                document: {
+                    type: 'cpf',
+                    number: cpfGerado
+                }
+            };
+
+            const order = {
+                transactionId: localTransactionId,
+                amount: amount,
+                paymentMethod: 'pix',
+                gateway: 'flevopay',
+                status: 'created',
+                customer: finalCustomer,
+                items: items,
+                deliveryData: req.body.deliveryData,
+                trackingParameters: trackingParameters,
+                clientIp: clientIp,
+                createdAt: new Date().toISOString(),
+                reportedStatuses: [],
+                isRetryFee: req.body.originalTransactionId ? true : false,
+                originalTransactionId: req.body.originalTransactionId || null
+            };
+            const orders = readOrders();
+            orders.push(order);
+            writeOrders(orders);
+
+            const protocol = req.protocol;
+            const host = req.get('host');
+            const baseUrl = `${protocol}://${host}`;
+
+            const flevoSettings = settings.gateways?.flevopay || {};
+            const secretKey = flevoSettings.secretKey || process.env.FLEVO_SECRET_KEY;
+
+            const flevoPayload = {
+                amount: Math.floor(amount),
+                description: items[0]?.title || "Pizza e Lenha",
+                reference: localTransactionId,
+                source: "api_externa",
+                customer: {
+                    name: customer.name,
+                    email: emailGerado,
+                    phone: telefoneFormatado,
+                    document: cpfGerado
+                },
+                postback_url: settings.gateways?.flevopay?.webhookUrl || `${baseUrl}/api/webhook/flevopay`
+            };
+
+            const trackingPayload = {};
+            if (trackingParameters) {
+                if (trackingParameters.utm_source) trackingPayload.utm_source = trackingParameters.utm_source;
+                if (trackingParameters.utm_medium) trackingPayload.utm_medium = trackingParameters.utm_medium;
+                if (trackingParameters.utm_campaign) trackingPayload.utm_campaign = trackingParameters.utm_campaign;
+                if (trackingParameters.utm_content) trackingPayload.utm_content = trackingParameters.utm_content;
+                if (trackingParameters.utm_term) trackingPayload.utm_term = trackingParameters.utm_term;
+                if (trackingParameters.src) trackingPayload.src = trackingParameters.src;
+                if (trackingParameters.sck) trackingPayload.sck = trackingParameters.sck;
+            }
+            if (Object.keys(trackingPayload).length > 0) {
+                flevoPayload.tracking = trackingPayload;
+            }
+
+            console.log('[API] Flevopay payload:', JSON.stringify(flevoPayload, null, 2));
+
+            const response = await fetchWithTimeout('https://app.flevopay.com.br/api/v1/transaction', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': secretKey
+                },
+                body: JSON.stringify(flevoPayload)
+            }, 30000);
+
+            const rawText = await response.text();
+            console.log('[API] Flevopay raw status:', response.status);
+            console.log('[API] Flevopay raw body:', rawText.substring(0, 500));
+
+            let data = {};
+            try {
+                data = JSON.parse(rawText);
+            } catch (e) {
+                console.error('[API] Flevopay response is NOT valid JSON:', rawText.substring(0, 300));
+                return res.status(500).json({
+                    error: 'Payment creation failed',
+                    message: `Flevopay retornou resposta inválida (status ${response.status})`,
+                    details: rawText.substring(0, 300)
+                });
+            }
+
+            if (!response.ok || data.status !== 'success') {
+                console.error('[API] Flevopay Error:', JSON.stringify(data, null, 2));
+                return res.status(response.status || 400).json({
+                    error: 'Payment creation failed',
+                    message: data.message || 'Flevopay API error',
+                    details: data
+                });
+            }
+
+            const pixCode = data.qr_code;
+            const pixBase64 = data.qr_code_base64 || '';
+            const flevoId = data.transaction_id;
+
+            (async () => {
+                const currentOrders = readOrders();
+                const idx = currentOrders.findIndex(o => o.transactionId === localTransactionId);
+                if (idx !== -1) {
+                    currentOrders[idx].huraId = flevoId;
+                    currentOrders[idx].status = 'waiting_payment';
+                    writeOrders(currentOrders);
+                    await sendToUtmify(currentOrders[idx]);
+                }
+            })();
+
+            return res.json({
+                success: true,
+                id: localTransactionId,
+                blackcatId: flevoId,
+                flevoId: flevoId,
+                pix: { qrcode: pixCode, qrcode_base64: pixBase64 }
+            });
+
         } else {
             // Placeholder for unknown gateway
             console.error(`[API] External Gateway '${activeGateway}' unknown.`);
@@ -992,6 +1123,49 @@ app.get('/api/payment/status/:transactionId', async (req, res) => {
             }
         }
 
+        // --- Flevopay Status Check ---
+        if (activeGateway === 'flevopay') {
+            const flevoSettings = settings.gateways?.flevopay || {};
+            const secretKey = flevoSettings.secretKey || process.env.FLEVO_SECRET_KEY;
+            const targetId = localOrder?.huraId || transactionId;
+
+            if (targetId) {
+                try {
+                    const response = await fetchWithTimeout(
+                        `https://app.flevopay.com.br/api/v1/query?action=get_transaction&id=${targetId}`,
+                        {
+                            method: 'GET',
+                            headers: { 'X-API-Key': secretKey }
+                        },
+                        15000
+                    );
+                    if (response.ok) {
+                        const data = await response.json();
+                        const fStatus = (data.status || '').toLowerCase();
+                        if (fStatus === 'approved') {
+                            if (localOrder && localOrder.status !== 'paid') {
+                                const updatedOrders = readOrders();
+                                const idx = updatedOrders.findIndex(o => String(o.transactionId) === String(transactionId));
+                                if (idx !== -1) {
+                                    updatedOrders[idx].status = 'paid';
+                                    writeOrders(updatedOrders);
+                                    startStatusAutomation(transactionId);
+                                    await sendToUtmify(updatedOrders[idx]);
+                                }
+                            }
+                            return res.json({ status: 'paid' });
+                        } else if (['failed', 'refunded', 'chargeback'].includes(fStatus)) {
+                            return res.json({ status: 'refused' });
+                        }
+                    }
+                } catch (err) {
+                    console.error('[API] Flevopay Status Check Error:', err.message);
+                }
+            }
+            const finalStatus = localOrder?.status === 'created' ? 'waiting_payment' : (localOrder?.status || 'waiting_payment');
+            return res.json({ status: finalStatus });
+        }
+
         // Return local status if everything else fails
         let finalStatus = localOrder?.status || 'waiting_payment';
         if (finalStatus === 'pending' || finalStatus === 'created') finalStatus = 'waiting_payment';
@@ -1003,6 +1177,68 @@ app.get('/api/payment/status/:transactionId', async (req, res) => {
         console.error('[API] Error checking status:', error);
         res.status(500).json({ error: 'Internal server error', message: error.message });
     }
+});
+
+// POST /api/webhook/flevopay - FlevoPay Webhook Listener
+app.post('/api/webhook/flevopay', (req, res) => {
+    const settings = readSettings();
+    if (settings.flevopayWebhookEnabled === false) {
+        console.log('[Webhook] Flevopay is DISABLED in settings. Ignoring.');
+        return res.json({ success: false, message: 'Webhook disabled' });
+    }
+
+    const notification = req.body;
+    console.log(`\n[Webhook] FLEVOPAY RAW PAYLOAD:`, JSON.stringify(notification, null, 2));
+
+    const fStatus = (notification.status || '').toLowerCase();
+    const externalId = notification.external_id;
+    const flevoId = notification.transaction_id;
+
+    console.log(`[Webhook] FLEVOPAY RECEIVED: TxId=${flevoId}, ExtId=${externalId}, Status=${fStatus}`);
+
+    // Respond immediately to FlevoPay
+    res.json({ success: true });
+
+    (async () => {
+        try {
+            if (fStatus !== 'approved') {
+                console.log(`[Webhook] FLEVOPAY: Status ${fStatus} is not approved.`);
+                return;
+            }
+
+            let orders = [];
+            let orderIndex = -1;
+
+            // Retry finding the order for 10 seconds
+            for (let attempt = 1; attempt <= 10; attempt++) {
+                orders = readOrders();
+                orderIndex = orders.findIndex(o =>
+                    (externalId && String(o.transactionId) === String(externalId)) ||
+                    (flevoId && String(o.huraId) === String(flevoId))
+                );
+                if (orderIndex !== -1) break;
+                if (attempt < 10) await new Promise(r => setTimeout(r, 1000));
+            }
+
+            if (orderIndex !== -1) {
+                const order = orders[orderIndex];
+                if (order.status !== 'paid') {
+                    console.log(`[Webhook] FLEVOPAY: ${order.status} -> paid for ${order.transactionId}`);
+                    
+                    orders[orderIndex].status = 'paid';
+                    orders[orderIndex].updatedAt = new Date().toISOString();
+                    writeOrders(orders);
+                    
+                    startStatusAutomation(order.transactionId);
+                    await sendToUtmify(orders[orderIndex]);
+                }
+            } else {
+                console.warn(`[Webhook] FLEVOPAY: NOT FOUND - TxId=${flevoId}, ExtId=${externalId}`);
+            }
+        } catch (err) {
+            console.error('[Webhook] FlevoPay Background Error:', err);
+        }
+    })();
 });
 
 // POST /api/webhook/blackcat - Black Cat Webhook Listener

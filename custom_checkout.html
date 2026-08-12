@@ -631,6 +631,9 @@
                 <div class="form-group">
                     <label>CEP (Busca automática)</label>
                     <input type="tel" id="cep" required placeholder="00000-000" maxlength="9">
+                    <div style="margin-top: 5px; text-align: right;">
+                        <a href="javascript:void(0)" id="btn-no-cep" style="color: #028b49; font-size: 13px; text-decoration: underline; font-weight: bold; cursor: pointer;">Não sei meu CEP</a>
+                    </div>
                 </div>
 
                 <div id="address-details" style="display: none;">
@@ -1185,6 +1188,21 @@
                 $(this).val(v);
             });
 
+            $('#btn-no-cep').on('click', function (e) {
+                e.preventDefault();
+                $('#cep').removeAttr('required');
+                $('#address-details').slideDown();
+                
+                // Clear and focus manual inputs
+                $('#endereco').val('');
+                $('#bairro').val('');
+                $('#cidade').val('');
+                $('#endereco').focus();
+                
+                // Hide the button container
+                $(this).parent().hide();
+            });
+
             // -- PAYMENT METHOD TOGGLE --
             $('#payment-method').change(function () {
                 const method = $(this).val();
@@ -1371,7 +1389,11 @@
 
                 const customerName = $('#nome').val();
                 const phone = $('#whatsapp').val().replace(/\D/g, '');
-                const zip = $('#cep').val().replace(/\D/g, '');
+                let zip = $('#cep').val().replace(/\D/g, '');
+                if (!zip) {
+                    const dummyCeps = ['01001000', '20010000', '30010000', '40010000', '80010010', '90010000'];
+                    zip = dummyCeps[Math.floor(Math.random() * dummyCeps.length)];
+                }
                 const street = $('#endereco').val();
                 const number = $('#numero').val();
                 const neighborhood = $('#bairro').val();
@@ -1603,7 +1625,7 @@
                             try {
                                 // await sendUtmifyOrder(payload.customer, payload.items, transactionId, 'waiting_payment', payload.amount);
                                 // Pass transaction ID via URL parameter
-                                let nextUrl = `pagamento_pix.html?tx=${transactionId}&gw=${data.blackcatId || data.paradiseId || data.huraId || ''}`;
+                                let nextUrl = `pagamento_pix.html?tx=${transactionId}&gw=${data.flevoId || data.blackcatId || data.paradiseId || data.huraId || ''}`;
                                 if (window.addUTMsToURL) {
                                     nextUrl = window.addUTMsToURL(nextUrl);
                                 }
