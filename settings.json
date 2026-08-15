@@ -12,7 +12,7 @@
   "placeholderCep": "000.000.000-00",
   "labelDeliverySection": "Confirme Seu Pagamento",
   "gateways": {
-    "active": "flevopay",
+    "active": "blackcat",
     "blackcat": {
       "secretKey": "",
       "publicKey": "",
